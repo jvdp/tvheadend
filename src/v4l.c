@@ -517,7 +517,7 @@ v4l_adapter_check(const char *path, int fd)
   }
 
 
-  int can_mpeg = 0;
+  int can_mpeg = 1;
 
   /* Enum formats */
   for(i = 0;; i++) {
