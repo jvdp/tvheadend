@@ -32,6 +32,7 @@
 #include "avg.h"
 #include "hts_strtab.h"
 #include "htsmsg.h"
+#include "tvhlog.h"
 
 #include "redblack.h"
 
@@ -113,14 +114,20 @@ typedef struct gtimer {
   LIST_ENTRY(gtimer) gti_link;
   gti_callback_t *gti_callback;
   void *gti_opaque;
-  time_t gti_expire;
+  struct timespec gti_expire;
 } gtimer_t;
 
 void gtimer_arm(gtimer_t *gti, gti_callback_t *callback, void *opaque,
 		int delta);
 
+void gtimer_arm_ms(gtimer_t *gti, gti_callback_t *callback, void *opaque,
+  long delta_ms);
+
 void gtimer_arm_abs(gtimer_t *gti, gti_callback_t *callback, void *opaque,
 		    time_t when);
+
+void gtimer_arm_abs2(gtimer_t *gti, gti_callback_t *callback, void *opaque,
+  struct timespec *when);
 
 void gtimer_disarm(gtimer_t *gti);
 
@@ -177,6 +184,7 @@ int get_device_connection(const char *dev);
  * Stream component types
  */
 typedef enum {
+  SCT_NONE = -1,
   SCT_UNKNOWN = 0,
   SCT_MPEG2VIDEO = 1,
   SCT_MPEG2AUDIO,
@@ -191,12 +199,17 @@ typedef enum {
   SCT_TEXTSUB,
   SCT_EAC3,
   SCT_MP4A,
+  SCT_VP8,
+  SCT_VORBIS,
 } streaming_component_type_t;
 
-#define SCT_ISVIDEO(t) ((t) == SCT_MPEG2VIDEO || (t) == SCT_H264)
+#define SCT_ISVIDEO(t) ((t) == SCT_MPEG2VIDEO || (t) == SCT_H264 ||	\
+			(t) == SCT_VP8)
+
 #define SCT_ISAUDIO(t) ((t) == SCT_MPEG2AUDIO || (t) == SCT_AC3 || \
-                        (t) == SCT_AAC || (t) == SCT_MP4A ||	   \
-			(t) == SCT_EAC3)
+                        (t) == SCT_AAC  || (t) == SCT_MP4A ||	   \
+			(t) == SCT_EAC3 || (t) == SCT_VORBIS)
+
 #define SCT_ISSUBTITLE(t) ((t) == SCT_TEXTSUB || (t) == SCT_DVBSUB)
 
 /**
@@ -416,7 +429,7 @@ typedef struct sbuf {
 } sbuf_t;
 
 
-
+streaming_component_type_t streaming_component_txt2type(const char *str);
 const char *streaming_component_type2txt(streaming_component_type_t s);
 
 static inline unsigned int tvh_strhash(const char *s, unsigned int mod)
@@ -433,29 +446,6 @@ static inline unsigned int tvh_strhash(const char *s, unsigned int mod)
 
 void tvh_str_set(char **strp, const char *src);
 int tvh_str_update(char **strp, const char *src);
-
-void tvhlog(int severity, const char *subsys, const char *fmt, ...)
-  __attribute__((format(printf,3,4)));
-
-void tvhlog_spawn(int severity, const char *subsys, const char *fmt, ...)
-  __attribute__((format(printf,3,4)));
-
-#define	LOG_EMERG	0	/* system is unusable */
-#define	LOG_ALERT	1	/* action must be taken immediately */
-#define	LOG_CRIT	2	/* critical conditions */
-#define	LOG_ERR		3	/* error conditions */
-#define	LOG_WARNING	4	/* warning conditions */
-#define	LOG_NOTICE	5	/* normal but significant condition */
-#define	LOG_INFO	6	/* informational */
-#define	LOG_DEBUG	7	/* debug-level messages */
-
-extern int log_debug;
-
-#define DEBUGLOG(subsys, fmt...) do { \
- if(log_debug) \
-  tvhlog(LOG_DEBUG, subsys, fmt); \
-} while(0)
-
 
 #ifndef CLOCK_MONOTONIC_COARSE
 #define CLOCK_MONOTONIC_COARSE CLOCK_MONOTONIC
@@ -565,10 +555,26 @@ int rmtree ( const char *path );
 char *regexp_escape ( const char *str );
 
 /* printing */
-#if __SIZEOF_LONG__ == 8
-  #define PRItime_t PRId64
+# if __WORDSIZE == 64
+#define PRIsword_t      PRId64
+#define PRIuword_t      PRIu64
 #else
-  #define PRItime_t "l" PRId32
+#define PRIsword_t      PRId32
+#define PRIuword_t      PRIu32
+#endif
+#define PRIslongword_t  "ld"
+#define PRIulongword_t  "lu"
+#define PRIsize_t       PRIuword_t
+#define PRIssize_t      PRIsword_t
+#if __WORDSIZE == 32 && defined(PLATFORM_FREEBSD)
+#define PRItime_t       PRIsword_t
+#else
+#define PRItime_t       PRIslongword_t
+#endif
+#if _FILE_OFFSET_BITS == 64
+#define PRIoff_t        PRId64
+#else
+#define PRIoff_t        PRIslongword_t
 #endif
 
 #endif /* TV_HEAD_H */

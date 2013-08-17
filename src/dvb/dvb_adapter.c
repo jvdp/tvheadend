@@ -23,7 +23,6 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
-#include <sys/epoll.h>
 #include <sys/types.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -48,6 +47,14 @@
 #include "epggrab.h"
 #include "diseqc.h"
 #include "atomic.h"
+#include "tvhpoll.h"
+
+#if ENABLE_EPOLL
+#include <sys/epoll.h>
+#elif ENABLE_KQUEUE
+#include <sys/event.h>
+#include <sys/time.h>
+#endif
 
 struct th_dvb_adapter_queue dvb_adapters;
 struct th_dvb_mux_instance_tree dvb_muxes;
@@ -738,6 +745,8 @@ dvb_adapter_stop ( th_dvb_adapter_t *tda, int opt )
     tvhlog(LOG_DEBUG, "dvb", "%s stopped thread", tda->tda_rootpath);
   }
 
+  dvb_adapter_notify(tda);
+
   /* Don't close FE */
   if (!tda->tda_idleclose && tda->tda_enabled) return;
 
@@ -747,8 +756,6 @@ dvb_adapter_stop ( th_dvb_adapter_t *tda, int opt )
     close(tda->tda_fe_fd);
     tda->tda_fe_fd = -1;
   }
-
-  dvb_adapter_notify(tda);
 }
 
 /**
@@ -957,6 +964,11 @@ dvb_adapter_destroy(th_dvb_adapter_t *tda)
 
   free(tda->tda_identifier);
   free(tda->tda_displayname);
+  free(tda->tda_fe_info);
+  free((void*)tda->tda_rootpath); /* need cast because it's a const char* */
+  free(tda->tda_fe_path);
+  free(tda->tda_demux_path);
+  free(tda->tda_dvr_path);
 
   free(tda);
 
@@ -1020,82 +1032,45 @@ static void *
 dvb_adapter_input_dvr(void *aux)
 {
   th_dvb_adapter_t *tda = aux;
-  th_dvb_mux_instance_t *tdmi;
-  int fd = -1, i, r, c, efd, nfds, dmx = -1;
+  int fd = -1, i, r, c, nfds, dmx = -1;
   uint8_t tsb[188 * 10];
   service_t *t;
-  struct epoll_event ev;
-  int delay = 10, locked = 0;
-  fe_status_t festat;
+  tvhpoll_t *pd;
+  tvhpoll_event_t ev[2];
 
-  /* Create poll */
-  efd = epoll_create(2);
-  memset(&ev, 0, sizeof(ev));
-  ev.events  = EPOLLIN;
-  ev.data.fd = tda->tda_dvr_pipe.rd;
-  epoll_ctl(efd, EPOLL_CTL_ADD, tda->tda_dvr_pipe.rd, &ev);
+  /* Install RAW demux */
+  if (tda->tda_rawmode) {
+    if ((dmx = dvb_adapter_raw_filter(tda)) == -1) {
+      tvhlog(LOG_ALERT, "dvb", "Unable to install raw mux filter");
+      return NULL;
+    }
+  }
+
+  /* Open DVR */
+  if ((fd = tvh_open(tda->tda_dvr_path, O_RDONLY | O_NONBLOCK, 0)) == -1) {
+    close(dmx);
+    return NULL;
+  }
+
+  pd = tvhpoll_create(2);
+  memset(ev, 0, sizeof(ev));
+  ev[0].data.fd = ev[0].fd = tda->tda_dvr_pipe.rd;
+  ev[0].events  = TVHPOLL_IN;
+  ev[1].data.fd = ev[1].fd = fd;
+  ev[1].events  = TVHPOLL_IN;
+  tvhpoll_add(pd, ev, 2);
 
   r = i = 0;
   while(1) {
 
     /* Wait for input */
-    nfds = epoll_wait(efd, &ev, 1, delay);
-
-    /* Exit */
-    if ((nfds > 0) && (ev.data.fd != fd)) break;
-
-    /* Check for lock */
-    if (!locked) {
-      if (ioctl(tda->tda_fe_fd, FE_READ_STATUS, &festat))
-        continue;
-      if (!(festat & FE_HAS_LOCK))
-        continue;
-
-      /* Open DVR */
-      fd = tvh_open(tda->tda_dvr_path, O_RDONLY | O_NONBLOCK, 0);
-      if (fd == -1) {
-        tvhlog(LOG_ALERT, "dvb", "Unable to open %s -- %s",
-               tda->tda_dvr_path, strerror(errno));
-        break;
-      }
-      ev.data.fd = fd;
-      epoll_ctl(efd, EPOLL_CTL_ADD, fd, &ev);
-
-      /* Note: table handlers must be installed with global lock */
-      pthread_mutex_lock(&global_lock);
-      tda->tda_locked = locked = 1;
-      delay           = -1;
-      if ((tdmi = tda->tda_mux_current)) {
-
-        /* Install table handlers */
-        dvb_table_add_default(tdmi);
-        epggrab_mux_start(tdmi);
-
-        /* Raw filter */
-        if(tda->tda_rawmode)
-          dmx = dvb_adapter_raw_filter(tda);
-
-        /* Service filters */
-        pthread_mutex_lock(&tda->tda_delivery_mutex);
-        LIST_FOREACH(t, &tda->tda_transports, s_active_link) {
-          if (t->s_dvb_mux_instance == tdmi) {
-            tda->tda_open_service(tda, t);
-            dvb_table_add_pmt(tdmi, t->s_pmt_pid);
-          }
-        }
-        pthread_mutex_unlock(&tda->tda_delivery_mutex);
-      }
-      pthread_mutex_unlock(&global_lock);
-
-      /* Error */
-      if (tda->tda_rawmode && (dmx == -1)) {
-        tvhlog(LOG_ALERT, "dvb", "Unable to install raw mux filter");
-        break;
-      }
-    }
+    nfds = tvhpoll_wait(pd, ev, 1, -1);
 
     /* No data */
     if (nfds < 1) continue;
+
+    /* Exit */
+    if (ev[0].data.fd != fd) break;
 
     /* Read data */
     c = read(fd, tsb+r, sizeof(tsb)-r);
@@ -1176,7 +1151,7 @@ dvb_adapter_input_dvr(void *aux)
 
   if(dmx != -1)
     close(dmx);
-  close(efd);
+  tvhpoll_destroy(pd);
   close(fd);
   return NULL;
 }
@@ -1308,16 +1283,17 @@ dvb_fe_opts(th_dvb_adapter_t *tda, const char *which)
     return a;
   }
 
-#if DVB_API_VERSION >= 5
   if(!strcmp(which, "delsys")) {
     if(c & FE_CAN_QPSK) {
+#if DVB_API_VERSION >= 5
       fe_opts_add(a, "SYS_DVBS",     SYS_DVBS);
       fe_opts_add(a, "SYS_DVBS2",    SYS_DVBS2);
-    } else
-      fe_opts_add(a, "SYS_UNDEFINED",    SYS_UNDEFINED);
+#else
+      fe_opts_add(a, "SYS_DVBS",     -1);
+#endif
+    }
     return a;
   }
-#endif
 
   if(!strcmp(which, "transmissionmodes")) {
     if(c & FE_CAN_TRANSMISSION_MODE_AUTO) 

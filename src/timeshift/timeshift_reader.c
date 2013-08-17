@@ -21,16 +21,21 @@
 #include "timeshift.h"
 #include "timeshift/private.h"
 #include "atomic.h"
+#include "tvhpoll.h"
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/epoll.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <string.h>
 #include <assert.h>
 
-//#define TSHFT_TRACE
+#if ENABLE_EPOLL
+#include <sys/epoll.h>
+#elif ENABLE_KQUEUE
+#include <sys/event.h>
+#include <sys/time.h>
+#endif
 
 /* **************************************************************************
  * File Reading
@@ -316,15 +321,11 @@ static int _timeshift_read
 
     /* Open file */
     if (*fd == -1) {
-#ifdef TSHFT_TRACE
-      tvhlog(LOG_DEBUG, "timeshift", "ts %d open file %s",
-             ts->id, (*cur_file)->path);
-#endif
+      tvhtrace("timeshift", "ts %d open file %s",
+               ts->id, (*cur_file)->path);
       *fd = open((*cur_file)->path, O_RDONLY);
     }
-#ifdef TSHFT_TRACE
-    tvhlog(LOG_DEBUG, "timeshift", "ts %d seek to %lu", ts->id, *cur_off);
-#endif
+    tvhtrace("timeshift", "ts %d seek to %"PRIoff_t, ts->id, *cur_off);
     lseek(*fd, *cur_off, SEEK_SET);
 
     /* Read msg */
@@ -335,10 +336,8 @@ static int _timeshift_read
       tvhlog(LOG_ERR, "timeshift", "ts %d could not read buffer", ts->id);
       return -1;
     }
-#ifdef TSHFT_TRACE
-    tvhlog(LOG_DEBUG, "timeshift", "ts %d read msg %p (%ld)",
-           ts->id, *sm, r);
-#endif
+    tvhtrace("timeshift", "ts %d read msg %p (%"PRIssize_t")",
+             ts->id, *sm, r);
 
     /* Incomplete */
     if (r == 0) {
@@ -408,7 +407,7 @@ static int _timeshift_flush_to_live
 void *timeshift_reader ( void *p )
 {
   timeshift_t *ts = p;
-  int efd, nfds, end, fd = -1, run = 1, wait = -1;
+  int nfds, end, fd = -1, run = 1, wait = -1;
   timeshift_file_t *cur_file = NULL;
   off_t cur_off = 0;
   int cur_speed = 100, keyframe_mode = 0;
@@ -418,13 +417,13 @@ void *timeshift_reader ( void *p )
   timeshift_index_iframe_t *tsi = NULL;
   streaming_skip_t *skip = NULL;
   time_t last_status = 0;
+  tvhpoll_t *pd;
+  tvhpoll_event_t ev = { 0 };
 
-  /* Poll */
-  struct epoll_event ev = { 0 };
-  efd        = epoll_create(1);
-  ev.events  = EPOLLIN;
-  ev.data.fd = ts->rd_pipe.rd;
-  epoll_ctl(efd, EPOLL_CTL_ADD, ev.data.fd, &ev);
+  pd = tvhpoll_create(1);
+  ev.fd     = ts->rd_pipe.rd;
+  ev.events = TVHPOLL_IN;
+  tvhpoll_add(pd, &ev, 1);
 
   /* Output */
   while (run) {
@@ -436,7 +435,7 @@ void *timeshift_reader ( void *p )
 
     /* Wait for data */
     if(wait)
-      nfds = epoll_wait(efd, &ev, 1, wait);
+      nfds = tvhpoll_wait(pd, &ev, 1, wait);
     else
       nfds = 0;
     wait      = -1;
@@ -447,13 +446,11 @@ void *timeshift_reader ( void *p )
     /* Control */
     pthread_mutex_lock(&ts->state_mutex);
     if (nfds == 1) {
-      if (_read_msg(ev.data.fd, &ctrl) > 0) {
+      if (_read_msg(ts->rd_pipe.rd, &ctrl) > 0) {
 
         /* Exit */
         if (ctrl->sm_type == SMT_EXIT) {
-#ifdef TSHFT_TRACE
-          tvhlog(LOG_DEBUG, "timeshift", "ts %d read exit request", ts->id);
-#endif
+          tvhtrace("timeshift", "ts %d read exit request", ts->id);
           run = 0;
           streaming_msg_free(ctrl);
           ctrl = NULL;
@@ -734,17 +731,17 @@ void *timeshift_reader ( void *p )
                (((cur_speed < 0) && (sm->sm_time >= deliver)) ||
                ((cur_speed > 0) && (sm->sm_time <= deliver))))) {
 
-#ifndef TSHFT_TRACE
+#if ENABLE_TRACE
       if (skip)
-#endif
       {
         time_t pts = 0;
         int64_t delta = now - sm->sm_time;
         if (sm->sm_type == SMT_PACKET)
           pts = ((th_pkt_t*)sm->sm_data)->pkt_pts;
-        tvhlog(LOG_DEBUG, "timeshift", "ts %d deliver %"PRId64" pts=%"PRItime_t " shift=%"PRIu64,
+        tvhtrace("timeshift", "ts %d deliver %"PRId64" pts=%"PRItime_t " shift=%"PRIu64,
                ts->id, sm->sm_time, pts, delta);
       }
+#endif
       streaming_target_deliver2(ts->output, sm);
       last_time = sm->sm_time;
       sm        = NULL;
@@ -755,10 +752,8 @@ void *timeshift_reader ( void *p )
       else
         wait = (deliver - sm->sm_time) / 1000;
       if (wait == 0) wait = 1;
-#ifdef TSHFT_TRACE
-      tvhlog(LOG_DEBUG, "timeshift", "ts %d wait %d",
-             ts->id, wait);
-#endif
+      tvhtrace("timeshift", "ts %d wait %d",
+               ts->id, wait);
     }
 
     /* Terminate */
@@ -815,12 +810,11 @@ void *timeshift_reader ( void *p )
   }
 
   /* Cleanup */
+  tvhpoll_destroy(pd);
   if (fd != -1) close(fd);
   if (sm)       streaming_msg_free(sm);
   if (ctrl)     streaming_msg_free(ctrl);
-#ifdef TSHFT_TRACE
-  tvhlog(LOG_DEBUG, "timeshift", "ts %d exit reader thread", ts->id);
-#endif
+  tvhtrace("timeshift", "ts %d exit reader thread", ts->id);
 
   return NULL;
 }

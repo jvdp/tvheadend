@@ -620,6 +620,8 @@ capmt_thread(void *aux)
 #if ENABLE_LINUXDVB
         th_dvb_adapter_t *tda;
         TAILQ_FOREACH(tda, &dvb_adapters, tda_global_link) {
+          if (!tda->tda_enabled)
+            continue;
           if (tda->tda_rootpath) {          //if rootpath is NULL then can't rely on tda_adapter_num because it is always 0
             if (tda->tda_adapter_num > MAX_CA) {
               tvhlog(LOG_ERR, "capmt", "adapter number > MAX_CA");
@@ -662,6 +664,9 @@ capmt_thread(void *aux)
     pthread_cond_timedwait(&capmt_config_changed, &global_lock, &ts);
     pthread_mutex_unlock(&global_lock);
   }
+
+  free(capmt->capmt_id);
+  free(capmt);
 
   return NULL;
 }
